@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1
+
+# =============================================================================
+# Firefly — Vercel container variant (Dockerfile.vercel)
+#
+# Vercel-specific deltas from the main Dockerfile:
+#   * no VOLUME — every instance is stateless; nothing written to the local
+#     filesystem survives (catalog/settings live in Turso, sessions are
+#     HMAC-signed via FIREFLY_SESSION_SECRET)
+#   * config dir + Turso embedded replica + native-lib cache under /tmp
+#     (the only writable path guaranteed in the runtime container)
+#   * entrypoint honours $PORT — Vercel routes to port 80 unless the project
+#     sets PORT in its environment
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Stage 1: Frontend production bundle (Bun + Vite)
+# -----------------------------------------------------------------------------
+FROM oven/bun:1 AS frontend
+WORKDIR /app/frontend
+
+COPY frontend/package.json frontend/bun.lock ./
+RUN bun install --frozen-lockfile
+
+COPY frontend/ ./
+RUN bun run build \
+    && test -f dist/index.html
+
+# -----------------------------------------------------------------------------
+# Stage 2: Go binary (embeds the frontend dist via //go:embed all:dist)
+# -----------------------------------------------------------------------------
+FROM golang:1.26-bookworm AS backend
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+COPY --from=frontend /app/frontend/dist ./frontend/dist
+
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath \
+        -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" \
+        -o /out/firefly ./cmd/firefly
+
+# -----------------------------------------------------------------------------
+# Stage 3: Runtime (glibc-based, non-root, stateless)
+# -----------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --create-home --home-dir /home/firefly --shell /usr/sbin/nologin firefly
+
+COPY --from=backend /out/firefly /usr/local/bin/firefly
+
+# Stateless: config seed + Turso replica rebuild from Turso on cold start.
+ENV FIREFLY_CONFIG_DIR=/tmp/firefly
+
+EXPOSE 80
+USER firefly
+
+# $PORT expansion happens at runtime; default matches Vercel's routing (80).
+ENTRYPOINT ["sh", "-c", "mkdir -p /tmp/firefly && exec /usr/local/bin/firefly -config-dir=/tmp/firefly -addr=0.0.0.0:${PORT:-80}"]
